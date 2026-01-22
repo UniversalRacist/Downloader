@@ -1,4 +1,10 @@
 flask
 yt-dlp
-gunicorn
+moviepy
+mutagen
+pydub
+spleeter
+syncedlyrics
 requests
+numpy
+scipy
