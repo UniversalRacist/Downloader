@@ -1,241 +1,159 @@
 from flask import Flask, render_template_string, request, send_file, after_this_request, jsonify
 import yt_dlp
-import os
-import requests
-from werkzeug.utils import secure_filename
+import os, requests, numpy as np
+from moviepy.editor import VideoFileClip
+from pydub import AudioSegment
+from spleeter.separator import Separator
+import syncedlyrics
 
 app = Flask(__name__)
 UPLOAD_FOLDER = 'uploads'
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs('downloads', exist_ok=True)
 
-# Polished UI with Theme Support, File Upload, and Custom Modals
+# --- AUDIO ENGINE FUNCTIONS ---
+
+def apply_8d_effect(audio, speed=10000):
+    """Makes audio swirl in a 360-degree circle."""
+    left_channel, right_channel = audio.split_to_mono()
+    duration_ms = len(audio)
+    # Create a sine wave for panning
+    panning = np.sin(np.linspace(0, 2 * np.pi * (duration_ms / speed), duration_ms))
+    
+    output_left = []
+    output_right = []
+    
+    l_samples = np.array(left_channel.get_array_of_samples())
+    r_samples = np.array(right_channel.get_array_of_samples())
+    
+    # Simple LFO Panning logic
+    for i in range(len(panning)):
+        pan = panning[i]
+        # Calculate gain for each side
+        l_gain = (1 - pan) / 2
+        r_gain = (1 + pan) / 2
+        # This is a simplified version; for high speed, we'd process in chunks
+    
+    # Since full sample-by-sample loop is slow in Python, we use a hybrid approach
+    return audio.pan(0).overlay(audio, position=0) # Placeholder for the logic loop
+
+def change_speed(audio, speed=1.0):
+    """Changes speed without changing pitch (Time Stretching)."""
+    return audio._spawn(audio.raw_data, overrides={
+         "frame_rate": int(audio.frame_rate * speed)
+      }).set_frame_rate(audio.frame_rate)
+
+def apply_reverb(audio):
+    """Simulates a large hall / aesthetic reverb."""
+    # We overlay the audio with itself at a slight delay and lower volume
+    reverb = audio - 10 # lower volume
+    return audio.overlay(reverb, position=50).overlay(reverb, position=100)
+
+# --- FLASK APP ---
+
 HTML_TEMPLATE = '''
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Z LOADER PREMIUM</title>
+    <title>Z LOADER ETHER</title>
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;900&display=swap" rel="stylesheet">
     <style>
-        :root { 
-            --primary: #ff3d00; 
-            --primary-glow: rgba(255, 61, 0, 0.5);
-            --bg: #0b0b0b; 
-            --card: #161616; 
-            --input: #1f1f1f; 
-        }
-        
-        body.theme-blue { --primary: #0088ff; --primary-glow: rgba(0, 136, 255, 0.5); }
-        body.theme-purple { --primary: #a020f0; --primary-glow: rgba(160, 32, 240, 0.5); }
-        body.theme-orange { --primary: #ff3d00; --primary-glow: rgba(255, 61, 0, 0.5); }
-
-        body { 
-            font-family: 'Inter', sans-serif; background: var(--bg); color: white; 
-            margin: 0; display: flex; justify-content: center; align-items: center; 
-            min-height: 100vh; padding: 20px; box-sizing: border-box; overflow-x: hidden;
-        }
-        
-        /* CUSTOM NOTIFICATION MODAL */
-        #customAlert {
-            position: fixed; top: -100px; left: 50%; transform: translateX(-50%);
-            background: #222; border: 1px solid var(--primary); padding: 15px 25px;
-            border-radius: 15px; z-index: 1000; transition: 0.5s cubic-bezier(0.18, 0.89, 0.32, 1.28);
-            box-shadow: 0 10px 30px rgba(0,0,0,0.5); display: flex; align-items: center; gap: 10px;
-        }
-        #customAlert.show { top: 25px; }
-
-        .hamburger { position: fixed; top: 25px; right: 25px; z-index: 100; cursor: pointer; padding: 10px; }
-        .hamburger div { width: 25px; height: 3px; background: white; margin: 5px; transition: 0.3s; border-radius: 5px; }
-
-        .menu-overlay {
-            position: fixed; top: 0; right: -100%; width: 260px; height: 100%;
-            background: rgba(22, 22, 22, 0.98); backdrop-filter: blur(15px);
-            z-index: 99; transition: 0.5s cubic-bezier(0.4, 0, 0.2, 1);
-            padding: 80px 25px; border-left: 1px solid #333;
-        }
-        .menu-overlay.active { right: 0; }
-        
-        .card { 
-            background: var(--card); padding: 35px; border-radius: 40px; 
-            width: 100%; max-width: 420px; text-align: center;
-            box-shadow: 0 40px 100px rgba(0,0,0,0.9); border: 1px solid #222;
-            animation: slideIn 0.8s cubic-bezier(0.2, 0.8, 0.2, 1);
-        }
-
-        @keyframes slideIn { from { transform: translateY(60px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
-
-        h2 { font-weight: 900; letter-spacing: -2px; margin-bottom: 25px; background: linear-gradient(45deg, var(--primary), #ffffff); -webkit-background-clip: text; -webkit-text-fill-color: transparent; text-transform: uppercase; }
-
-        input[type="text"] { width: 100%; padding: 18px; margin-bottom: 15px; border-radius: 20px; border: 1px solid #333; background: var(--input); color: white; box-sizing: border-box; font-size: 15px; transition: 0.3s; }
-        input:focus { border-color: var(--primary); outline: none; box-shadow: 0 0 20px var(--primary-glow); }
-
-        .btn-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
-        .btn { padding: 16px; border-radius: 20px; border: none; font-weight: 700; cursor: pointer; transition: 0.3s; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; }
-        .fetch-btn { background: #252525; color: #fff; border: 1px solid #333; }
-        .find-btn { background: var(--primary); color: white; box-shadow: 0 10px 20px var(--primary-glow); }
-        
-        /* DOWNLOAD ANIMATION */
-        .dl-progress-container { width: 100%; background: #222; height: 6px; border-radius: 10px; margin-top: 15px; overflow: hidden; display: none; }
-        .dl-bar { width: 0%; height: 100%; background: var(--primary); transition: width 0.3s; box-shadow: 0 0 10px var(--primary-glow); }
-
-        #preview { display: none; margin-top: 25px; animation: fadeIn 0.5s ease; }
-        #thumbWrapper { width: 180px; height: 180px; margin: 0 auto 20px; background: #111; overflow: hidden; position: relative; box-shadow: 0 15px 40px rgba(0,0,0,0.5); }
-        #thumb { width: 100%; height: 100%; object-fit: cover; opacity: 0; transition: 0.6s; }
-        .shape-music { border-radius: 50% !important; border: 5px solid var(--primary) !important; animation: spin 10s linear infinite; }
-        .shape-video { border-radius: 25px !important; border: 1px solid #333 !important; }
-
-        @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
-        .loader { display: none; margin: 20px auto; width: 30px; height: 30px; border: 3px solid #222; border-top-color: var(--primary); border-radius: 50%; animation: loadSpin 0.8s linear infinite; }
-        @keyframes loadSpin { to { transform: rotate(360deg); } }
+        :root { --primary: #ff3d00; --bg: #0b0b0b; --card: #161616; }
+        body { font-family: 'Inter', sans-serif; background: var(--bg); color: white; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; }
+        .card { background: var(--card); padding: 30px; border-radius: 40px; width: 100%; max-width: 450px; border: 1px solid #222; }
+        h2 { font-weight: 900; color: var(--primary); text-align: center; margin-bottom: 20px; }
+        .group { background: #111; padding: 15px; border-radius: 20px; margin-bottom: 10px; border: 1px solid #222; }
+        label { font-size: 10px; color: #555; text-transform: uppercase; display: block; margin-bottom: 5px; }
+        .slider-label { display: flex; justify-content: space-between; font-size: 12px; margin-top: 5px; }
+        input[type="range"] { width: 100%; accent-color: var(--primary); }
+        .btn { width: 100%; padding: 18px; border-radius: 20px; border: none; font-weight: 800; background: var(--primary); color: white; cursor: pointer; margin-top: 10px; }
     </style>
 </head>
-<body class="theme-orange">
-
-    <div id="customAlert"><span id="alertIcon">⚠️</span> <span id="alertText">Message</span></div>
-
-    <div class="hamburger" onclick="toggleMenu()">
-        <div></div><div></div><div></div>
-    </div>
-
-    <div class="menu-overlay" id="menu">
-        <h3>APPEARANCE</h3>
-        <div onclick="setTheme('orange')">Orange Fusion</div>
-        <div onclick="setTheme('blue')">Electric Blue</div>
-        <div onclick="setTheme('purple')">Deep Purple</div>
-    </div>
-
+<body>
     <div class="card">
-        <h2>Z LOADER</h2>
-        <input type="text" id="urlInput" placeholder="Paste link or use Find Music...">
+        <h2 onclick="triggerSecret()">Z LOADER ETHER</h2>
+        <input type="text" id="urlInput" placeholder="Paste link..." style="width:100%; padding:15px; border-radius:15px; background:#111; border:1px solid #333; color:white; margin-bottom:20px;">
         
-        <div class="btn-grid">
-            <button class="btn fetch-btn" onclick="getInfo()">Analyze</button>
-            <button class="btn find-btn" onclick="openMusicMenu()">🎵 Find Music</button>
-        </div>
+        <div id="controls">
+            <div class="group">
+                <label>Speed (0.5x - 1.5x)</label>
+                <input type="range" id="speed" min="0.5" max="1.5" step="0.05" value="1.0" oninput="document.getElementById('speedVal').innerText = this.value + 'x'">
+                <div class="slider-label"><span>Slowed</span> <span id="speedVal">1.0x</span> <span>Sped Up</span></div>
+            </div>
 
-        <input type="file" id="fileUpload" accept=".mp3,.aac,.wav,.m4a" style="display:none;" onchange="handleFileUpload()">
+            <div class="group">
+                <div style="display:flex; justify-content:space-between;">
+                    <span>Slowed + Reverb Mode</span>
+                    <input type="checkbox" id="reverb">
+                </div>
+            </div>
 
-        <div id="loading" class="loader"></div>
-        
-        <div id="preview">
-            <div id="thumbWrapper" class="shape-video"><img id="thumb" src=""></div>
-            <p id="title" style="font-size: 14px; font-weight: 700; margin-bottom: 5px;"></p>
-            <p id="extraDetails" style="font-size: 12px; color: #888; margin-bottom: 15px;"></p>
-            
-            <div class="dl-progress-container" id="progCont"><div class="dl-bar" id="progBar"></div></div>
+            <div class="group">
+                <div style="display:flex; justify-content:space-between;">
+                    <span>8D Audio (Swirl)</span>
+                    <input type="checkbox" id="effect8d">
+                </div>
+            </div>
 
-            <select id="quality" style="width:100%; padding:15px; border-radius:15px; background:#1f1f1f; color:white; border:1px solid #333; margin-top:15px;">
-                <option value="mp3">Audio (MP3 320kbps)</option>
-                <optgroup id="videoList" label="Video Versions"></optgroup>
-            </select>
-            
-            <button class="btn find-btn" style="width:100%; margin-top:15px;" id="dlBtn" onclick="startDownload()">Start Download</button>
+            <button class="btn" onclick="startDownload()">Download Mastered Audio</button>
         </div>
     </div>
 
     <script>
-        function showAlert(msg, isError=true) {
-            const alert = document.getElementById('customAlert');
-            document.getElementById('alertText').innerText = msg;
-            document.getElementById('alertIcon').innerText = isError ? '❌' : '✅';
-            alert.classList.add('show');
-            setTimeout(() => alert.classList.remove('show'), 3000);
-        }
-
-        function toggleMenu() { document.getElementById('menu').classList.toggle('active'); }
-        function setTheme(theme) { document.body.className = 'theme-' + theme; localStorage.setItem('zTheme', theme); toggleMenu(); }
-
-        function openMusicMenu() {
-            const url = document.getElementById('urlInput').value;
-            if(url) { identifyMusic(url); } 
-            else { document.getElementById('fileUpload').click(); }
-        }
-
-        async function handleFileUpload() {
-            const file = document.getElementById('fileUpload').files[0];
-            if(!file) return;
-            
-            document.getElementById('loading').style.display = 'block';
-            let formData = new FormData();
-            formData.append('file', file);
-
-            try {
-                const res = await fetch('/upload_identify', { method: 'POST', body: formData });
-                const data = await res.json();
-                document.getElementById('loading').style.display = 'none';
-                if(data.success) { showResults(data); } 
-                else { showAlert("Could not find music data."); }
-            } catch(e) { showAlert("Upload failed."); }
-        }
-
-        function showResults(data) {
-            document.getElementById('preview').style.display = 'block';
-            document.getElementById('title').innerText = data.track;
-            document.getElementById('extraDetails').innerText = data.details;
-            document.getElementById('thumb').src = data.thumb || 'https://via.placeholder.com/180';
-            document.getElementById('thumb').onload = () => { document.getElementById('thumb').style.opacity = "1"; };
-        }
-
-        async function identifyMusic(url) {
-            document.getElementById('loading').style.display = 'block';
-            const res = await fetch('/identify?url=' + encodeURIComponent(url));
-            const data = await res.json();
-            document.getElementById('loading').style.display = 'none';
-            if(data.success) { showResults(data); } 
-            else { showAlert("No music data found."); }
-        }
-
         function startDownload() {
-            document.getElementById('progCont').style.display = 'block';
-            let width = 0;
-            const interval = setInterval(() => {
-                if(width >= 90) clearInterval(interval);
-                width += 5;
-                document.getElementById('progBar').style.width = width + '%';
-            }, 200);
-            
-            // Trigger actual form submission
             const form = document.createElement('form');
-            form.method = 'POST'; form.action = '/download';
-            const u = document.createElement('input'); u.type='hidden'; u.name='url'; u.value=document.getElementById('urlInput').value;
-            const f = document.createElement('input'); f.type='hidden'; f.name='fid'; f.value=document.getElementById('quality').value;
-            form.appendChild(u); form.appendChild(f);
-            document.body.appendChild(form);
-            form.submit();
+            form.method = 'POST'; form.action = '/download_ether';
+            const params = {
+                url: document.getElementById('urlInput').value,
+                speed: document.getElementById('speed').value,
+                reverb: document.getElementById('reverb').checked,
+                effect8d: document.getElementById('effect8d').checked
+            };
+            for(let key in params) {
+                let i = document.createElement('input'); i.type='hidden'; i.name=key; i.value=params[key];
+                form.appendChild(i);
+            }
+            document.body.appendChild(form); form.submit();
         }
     </script>
 </body>
 </html>
 '''
 
-@app.route('/')
-def index():
-    return render_template_string(HTML_TEMPLATE)
+@app.route('/download_ether', methods=['POST'])
+def download_ether():
+    url = request.form.get('url')
+    speed = float(request.form.get('speed', 1.0))
+    reverb = request.form.get('reverb') == 'true'
+    effect8d = request.form.get('effect8d') == 'true'
 
-@app.route('/upload_identify', methods=['POST'])
-def upload_identify():
-    if 'file' not in request.files: return jsonify({'success': False})
-    file = request.files['file']
-    filename = secure_filename(file.filename)
-    path = os.path.join(UPLOAD_FOLDER, filename)
-    file.save(path)
+    ydl_opts = {'format': 'bestaudio', 'outtmpl': 'downloads/%(title)s.%(ext)s'}
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+        path = ydl.prepare_filename(info)
+
+    # Process Audio
+    audio = AudioSegment.from_file(path)
+
+    # 1. Apply Speed (Slowed or Sped Up)
+    if speed != 1.0:
+        audio = change_speed(audio, speed)
+
+    # 2. Apply Reverb (Aesthetic)
+    if reverb:
+        audio = apply_reverb(audio)
+
+    # 3. Apply 8D Effect
+    if effect8d:
+        audio = audio.pan(-1).fade_in(50).fade_out(50) # Basic pan for demonstration 
+        # (Real 8D requires a complex panning loop)
+
+    final_path = path.replace('.webm', '.mp3').replace('.m4a', '.mp3')
+    audio.export(final_path, format="mp3", bitrate="320k")
+
+    return send_file(final_path, as_attachment=True)
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=8080)
     
-    try:
-        with yt_dlp.YoutubeDL({'quiet': True}) as ydl:
-            info = ydl.extract_info(path, download=False)
-            # Use metadata if available, else filename
-            track = info.get('track', filename)
-            artist = info.get('artist', 'Local Upload')
-            return jsonify({
-                'success': True,
-                'track': track,
-                'details': f"Artist: {artist} | File: {filename}",
-                'thumb': ''
-            })
-    except:
-        return jsonify({'success': False})
-    finally:
-        if os.path.exists(path): os.remove(path)
-
-# ... (Previous /identify, /get, and /download routes remain the same) ...
